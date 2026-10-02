@@ -1,0 +1,6 @@
+# 課程提供的檔案，不放進 repo
+hash.h
+hw1
+test/build/
+test/exp/work_*/
+test/exp/results/*.log
