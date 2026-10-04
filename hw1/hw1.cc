@@ -1,936 +1,557 @@
-// Candidate v4: same v3 placement, sorting and MPI protocol; independent merge streams.
-// Topology-aware active ranks, batched neighbor partition probes,
-// branchless sparse merge and shared scratch. No non-neighbor element exchanges.
-#ifndef HW1_SORT
-#define HW1_SORT 2
-#endif
+// =============================================================================
+// CS542200 HW1: Odd-Even Sort (MPI) with multi-round hashing
+//
+// 整體流程（每個 rank 都執行同一份程式）：
+//
+//   1. 讀檔：所有 rank 平均分配資料，rank r 讀取連續的一段（block distribution）。
+//   2. 把每個 float 轉成「可排序的 uint32 key」：
+//        無號整數的大小順序 = 原本浮點數的大小順序。
+//      之後所有排序、比較、交換都直接用整數 key 完成。
+//   3. 每一輪：
+//        a. local LSD radix sort
+//             round 0：32-bit key，11 + 11 + 10 bit 三個 pass
+//             之後  ：hash 輸出只有 24 bit，8 + 8 + 8 bit 三個 pass
+//        b. odd-even phases，每次 compare-split 只交換「可能需要移動」的元素
+//   4. 每輪結束（最後一輪除外）都做 hash，最後寫檔。
+//
+// 主要演算法優化：
+//   (A) radix sort 取代 comparison sort；histogram 一次算好（round 0 在排序前一次讀完，
+//       之後的 round 在 hash 的同一個迴圈裡順便統計），每個 pass 只需要 scatter。
+//   (B) selective compare-split：先交換邊界值，已有序就跳過；
+//       否則只送出可能移動的元素，並且只 merge 出自己要留下的那一半。
+//   (C) 用整數 key 取代 float：radix、比較都直接作用在整數上。
+//   (D) 跨節點壓縮：相鄰兩個 rank 在不同節點時，送出的已排序資料改送
+//       「和前一個數的差值」並用變長編碼（varint），網路傳輸量約剩 1/4～1/2。
+//   (E) 終止條件：理論上 p 個 phase 內一定排好，所以前 p 個 phase
+//       完全不做 Allreduce，之後才每個 cycle 檢查一次。
+// =============================================================================
 #include <mpi.h>
 
 #include <algorithm>
-#include <climits>
-#include <cmath>
 #include <cstdint>
-#include <cstring>
 #include <cstdio>
 #include <cstdlib>
-#include <limits>
+#include <cstring>
 #include <vector>
-
 
 #include "hash.h"
 
-// Compile-time switches support one-change-at-a-time comparisons.
-// SORT=0 original 16/16; SORT=1 previous 11/11/10; SORT=2 24-bit hash keys.
-#ifndef HW1_SORT
-#define HW1_SORT 0
-#endif
-#ifndef HW1_MERGE
-#define HW1_MERGE 1
-#endif
-#ifndef HW1_STOP
-#define HW1_STOP 1
-#endif
-// Use a contiguous prefix on rank 0's host to avoid cross-node element traffic.
-// All ranks still participate in MPI-IO and termination checks.
-#ifndef HW1_FIRST_NODE
-#define HW1_FIRST_NODE 1
-#endif
-#ifndef HW1_MAX_ACTIVE
-#define HW1_MAX_ACTIVE 4
-#endif
+using Key = uint32_t;
 
-#ifndef HW1_PROBES
-#define HW1_PROBES 7
-#endif
-#ifndef HW1_BUFFERED
-#define HW1_BUFFERED 0
-#endif
-#ifndef HW1_BUFFERED_MIN
-#define HW1_BUFFERED_MIN 262144
-#endif
-#ifndef HW1_BRANCHLESS
-#define HW1_BRANCHLESS 1
-#endif
-static_assert(HW1_PROBES >= 1 && HW1_PROBES <= 31, "Invalid probe count");
+// MPI tag：不同用途的訊息用不同 tag，避免互相配對錯誤
+enum Tag { TAG_EDGE = 1, TAG_DATA = 2 };
 
-static_assert(HW1_SORT >= 0 && HW1_SORT <= 2, "Invalid sort mode");
+// =============================================================================
+// Key 編碼
+// =============================================================================
 
-#ifdef HW1_PROFILE
-static double hw1_times[6] = {};
-struct Hw1Timer {
-    int id; double start;
-    explicit Hw1Timer(int i) : id(i), start(MPI_Wtime()) {}
-    ~Hw1Timer() { hw1_times[id] += MPI_Wtime() - start; }
+// ---- Round 0：任意 float ↔ 32-bit key ---------------------------------------
+// IEEE-754 的正數直接比 bit pattern 就是正確順序；負數的順序剛好相反。
+//   正數：把 sign bit 設成 1         → 排在所有負數後面
+//   負數：所有 bit 取反（~bits）      → 絕對值越大，key 越小
+static inline Key float_bits_to_key(uint32_t bits) {
+    return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
+}
+static inline uint32_t key_to_float_bits(Key key) {
+    return (key & 0x80000000u) ? (key & 0x7fffffffu) : ~key;
+}
+
+static inline float bits_to_float(uint32_t bits) {
+    float f;
+    std::memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
+// ---- Round 1..R-1：hash 輸出 ↔ 24-bit key ----------------------------------
+// hw1_hash 的輸出一定是 [-2^23, 2^23) 之間的整數，加上 2^23 之後
+// 就變成 [0, 2^24) 的非負整數，大小順序不變。
+constexpr int32_t HASH_OFFSET = 1 << 23;
+
+static inline Key hash_output_to_key(float value) {
+    return static_cast<Key>(static_cast<int32_t>(value) + HASH_OFFSET);
+}
+static inline float hash_key_to_float(Key key) {
+    return static_cast<float>(static_cast<int32_t>(key) - HASH_OFFSET);
+}
+
+// ---- 24-bit key 的 radix sort：8 + 8 + 8 bit 三個 pass ---------------------
+// 在課程機器上實測（test/opt/run_opt.sh [4]），每個 pass 256 個桶比 12 + 12 bit
+// （4096 個桶）快：寫入位置少，256 個寫入位置都能留在 cache 裡。
+constexpr int DIGIT_BITS_24 = 8;
+constexpr int PASSES_24 = 3;
+constexpr int RADIX_24 = 1 << DIGIT_BITS_24;     // 每個 pass 256 個桶
+constexpr Key DIGIT_MASK_24 = RADIX_24 - 1;
+
+// =============================================================================
+// 資料分配
+// =============================================================================
+
+// 資料太少時，讓很多 rank 一起做反而只會增加通訊次數。
+// 所以每個參與排序的 rank 至少要分到這麼多元素；資料夠多時（N >= 4096 × size）
+// 所有 rank（包含其他節點上的 rank）都會分到資料、參與排序。
+constexpr long long MIN_ELEMENTS_PER_RANK = 4096;
+
+struct Layout {
+    int rank = 0;
+    int size = 1;
+    int active = 1;           // 實際分到資料的 rank 數（rank 0..active-1）
+    std::vector<int> count;   // count[r] = rank r 擁有的元素數
+    int local_n = 0;          // = count[rank]
+    int global_start = 0;     // 本 rank 第一個元素在全域排序結果中的 index
+    int max_count = 0;        // 所有 rank 中最大的 count（決定接收 buffer 大小）
+    std::vector<int> node;    // node[r] = rank r 所在節點的編號（同一台節點的 rank 編號相同）
 };
-#define HW1_TIMER(id) Hw1Timer hw1_timer(id)
-#else
-#define HW1_TIMER(id) ((void)0)
-#endif
 
+// 查出每個 rank 在哪一台節點：交換主機名稱，名稱相同就是同一台。
+// 只在初始化時做一次（規定允許初始化使用 collective）。
+static std::vector<int> find_nodes(int size) {
+    char name[MPI_MAX_PROCESSOR_NAME] = {};
+    int len = 0;
+    MPI_Get_processor_name(name, &len);
+    std::vector<char> all(static_cast<size_t>(size) * MPI_MAX_PROCESSOR_NAME);
+    MPI_Allgather(name, MPI_MAX_PROCESSOR_NAME, MPI_CHAR, all.data(), MPI_MAX_PROCESSOR_NAME, MPI_CHAR,
+                  MPI_COMM_WORLD);
 
-
-// -----------------------------------------------------------------------------
-// Stable 2-pass LSD radix sort for finite IEEE-754 binary32 floats.
-//
-// Transform the raw float bits into an unsigned key whose integer ordering
-// matches numeric float ordering:
-//   negative: ~bits
-//   positive: bits ^ 0x80000000
-//
-// We never overwrite the float with the transformed key.  The original 32-bit
-// float payload is copied unchanged to the output buffer, which is important
-// because later hw1_hash() must see the original float value/bit pattern.
-//
-// Each pass uses 16 radix bits => 65536 buckets, so sorting takes two linear
-// passes instead of comparison-based O(n log n) sorting.
-// -----------------------------------------------------------------------------
-static inline uint32_t float_sort_key(float x) {
-    uint32_t bits;
-    std::memcpy(&bits, &x, sizeof(bits));
-
-    if (bits & 0x80000000u)
-        return ~bits;
-
-    return bits ^ 0x80000000u;
+    // 節點編號 = 第一個和自己同名的 rank 的編號
+    std::vector<int> node(size);
+    for (int r = 0; r < size; ++r) {
+        node[r] = r;
+        for (int q = 0; q < r; ++q) {
+            if (std::strcmp(&all[static_cast<size_t>(q) * MPI_MAX_PROCESSOR_NAME],
+                            &all[static_cast<size_t>(r) * MPI_MAX_PROCESSOR_NAME]) == 0) {
+                node[r] = node[q];
+                break;
+            }
+        }
+    }
+    return node;
 }
 
-static void radix_sort_float(
-    std::vector<float>& data,
-    std::vector<float>& temp,
-    std::vector<size_t>& count
-) {
-    const size_t n = data.size();
-    if (n <= 1)
-        return;
+static Layout make_layout(int rank, int size, int n) {
+    Layout L;
+    L.rank = rank;
+    L.size = size;
 
-    constexpr size_t RADIX = 1u << 16;
-    constexpr uint32_t MASK = 0xffffu;
+    // 參與排序的 rank 數 = min(size, ceil(n / MIN_ELEMENTS_PER_RANK))，至少 1 個
+    const long long by_size = (n + MIN_ELEMENTS_PER_RANK - 1) / MIN_ELEMENTS_PER_RANK;
+    L.active = static_cast<int>(std::max(1LL, std::min<long long>(size, by_size)));
 
-    // Pass 0: low 16 bits of transformed key.
-    std::fill(count.begin(), count.end(), size_t{0});
+    // 前 rem 個 rank 多拿一個，其餘拿 base 個；rank >= active 拿 0 個
+    const int base = n / L.active;
+    const int rem = n % L.active;
+    L.count.assign(size, 0);
+    for (int r = 0; r < L.active; ++r) L.count[r] = base + (r < rem ? 1 : 0);
 
-    for (size_t i = 0; i < n; ++i) {
-        const uint32_t key = float_sort_key(data[i]);
-        ++count[key & MASK];
-    }
+    L.local_n = L.count[rank];
+    L.max_count = base + (rem > 0 ? 1 : 0);
 
-    size_t sum = 0;
-    for (size_t b = 0; b < RADIX; ++b) {
-        const size_t c = count[b];
-        count[b] = sum;
-        sum += c;
-    }
+    // global_start = 前面所有 rank 的元素數總和
+    // （等同作業說明中的 MPI_Exscan；每個 rank 的元素數全程不變，所以只算一次）
+    L.global_start = 0;
+    for (int r = 0; r < rank; ++r) L.global_start += L.count[r];
 
-    for (size_t i = 0; i < n; ++i) {
-        const float x = data[i];
-        const uint32_t key = float_sort_key(x);
-        temp[count[key & MASK]++] = x;
-    }
+    L.node = find_nodes(size);
+    return L;
+}
 
-    // Pass 1: high 16 bits of transformed key.
-    std::fill(count.begin(), count.end(), size_t{0});
+// MPI-IO 的錯誤預設是「回傳錯誤碼」而不是中止程式（MPI_ERRORS_RETURN），
+// 不檢查的話，檔案打不開時程式會什麼都沒寫就正常結束。
+// 所以每個 MPI_File_* 呼叫都要檢查，失敗就印出原因並中止。
+static void check_io(int rc, const char* what, const char* path) {
+    if (rc == MPI_SUCCESS) return;
+    char reason[MPI_MAX_ERROR_STRING];
+    int len = 0;
+    MPI_Error_string(rc, reason, &len);
+    std::fprintf(stderr, "hw1: %s '%s' failed: %s\n", what, path, reason);
+    MPI_Abort(MPI_COMM_WORLD, 1);
+}
 
-    for (size_t i = 0; i < n; ++i) {
-        const uint32_t key = float_sort_key(temp[i]);
-        ++count[(key >> 16) & MASK];
-    }
+// 和鄰居交換一個 key
+static Key exchange_one(Key mine, int partner) {
+    Key theirs = 0;
+    MPI_Sendrecv(&mine, 1, MPI_UINT32_T, partner, TAG_EDGE,
+                 &theirs, 1, MPI_UINT32_T, partner, TAG_EDGE,
+                 MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    return theirs;
+}
 
-    sum = 0;
-    for (size_t b = 0; b < RADIX; ++b) {
-        const size_t c = count[b];
-        count[b] = sum;
-        sum += c;
-    }
+// =============================================================================
+// 所有 rank 共用的工作空間（整個程式只配置一次，不在迴圈內 allocate）
+// =============================================================================
+struct Workspace {
+    std::vector<Key> keys;        // 本 rank 的資料
+    std::vector<Key> tmp;         // 和 keys 一樣大，用來做 out-of-place 的重排
+    std::vector<Key> recv;        // 接收鄰居資料
+    std::vector<uint32_t> hist;   // 24-bit radix sort 兩個 pass 的 histogram（hash 時順便算好）
+    std::vector<uint8_t> send_bytes;  // 跨節點壓縮用（只有鄰居在別台節點的 rank 才配置）
+    std::vector<uint8_t> recv_bytes;
+};
 
-    for (size_t i = 0; i < n; ++i) {
-        const float x = temp[i];
-        const uint32_t key = float_sort_key(x);
-        data[count[(key >> 16) & MASK]++] = x;
+// =============================================================================
+// Odd-even phase 的主迴圈（每一輪都一樣）
+//
+// compare_split(partner) 負責和 partner 做一次 compare-split，
+// 有資料移動就回傳 true。
+//
+// 終止條件：
+//   * block 版 odd-even sort 在各 block 已經可比較的情況下，active 個 phase
+//     內就會排好。所以前 active 個 phase 不做任何全域同步。
+//   * 之後每做完一個 cycle（even + odd）做一次 Allreduce；
+//     如果整個 cycle 所有 rank 都沒有移動資料，代表每一對相鄰 block 都已有序，
+//     整體就排好了。這個檢查保證正確性，不依賴上面的理論界限。
+// =============================================================================
+template <class CompareSplit>
+static void run_odd_even_phases(const Layout& L, CompareSplit&& compare_split) {
+    if (L.active <= 1) return;   // 只有一個 rank 有資料：local sort 就是全部
+
+    for (int phase = 0;;) {
+        int changed = 0;
+
+        // 一個 cycle = even phase + odd phase
+        for (int half = 0; half < 2; ++half, ++phase) {
+            // even phase 配對 (0,1),(2,3)...；odd phase 配對 (1,2),(3,4)...
+            const bool pair_with_right = ((phase + L.rank) % 2 == 0);
+            const int partner = pair_with_right ? L.rank + 1 : L.rank - 1;
+
+            if (L.rank < L.active && partner >= 0 && partner < L.active && compare_split(partner))
+                changed = 1;
+        }
+
+        if (phase < L.active) continue;   // 還在理論界限內，先不檢查
+
+        int any_changed = 0;
+        MPI_Allreduce(&changed, &any_changed, 1, MPI_INT, MPI_LOR, MPI_COMM_WORLD);
+        if (!any_changed) break;
     }
 }
 
-[[maybe_unused]] static void radix_sort_float_11(std::vector<float>& data,
-                             std::vector<float>& temp,
-                             std::vector<uint32_t>& count) {
-    const size_t n = data.size();
+// =============================================================================
+// Local sort：LSD radix sort
+// =============================================================================
+
+// Round 0：任意 32-bit key。，32 bit 拆成 11 + 11 + 10 bit 三個 pass。
+// 一次讀取就算出三個 pass 的 histogram，之後每個 pass 只需要 scatter。
+static void radix_sort_32(std::vector<Key>& keys, std::vector<Key>& tmp) {
+    const size_t n = keys.size();
     if (n <= 1) return;
-    if (n <= 2048) {
-        std::sort(data.begin(), data.end(), [](float a, float b) {
-            return float_sort_key(a) < float_sort_key(b);
-        });
-        return;
-    }
-    constexpr unsigned B = 2048;
-    std::fill(count.begin(), count.end(), 0u);
-    for (float x : data) {
-        const uint32_t k = float_sort_key(x);
-        ++count[k & 2047];
-        ++count[B + ((k >> 11) & 2047)];
-        ++count[2 * B + (k >> 22)];
-    }
-    for (unsigned pass = 0; pass < 3; ++pass) {
+
+    constexpr int PASSES = 3;
+    constexpr int SHIFT[PASSES] = {0, 11, 22};
+    constexpr Key MASK[PASSES] = {0x7ff, 0x7ff, 0x3ff};
+    constexpr int RADIX = 2048;
+
+    std::vector<uint32_t> offset(PASSES * RADIX, 0);
+    for (Key k : keys)
+        for (int p = 0; p < PASSES; ++p) ++offset[p * RADIX + ((k >> SHIFT[p]) & MASK[p])];
+
+    // histogram → 每個 digit 的起始位置（exclusive prefix sum）
+    for (int p = 0; p < PASSES; ++p) {
         uint32_t sum = 0;
-        const unsigned buckets = pass == 2 ? 1024 : B;
-        for (unsigned b = 0; b < buckets; ++b) {
-            const uint32_t c = count[pass * B + b];
-            count[pass * B + b] = sum;
+        for (int d = 0; d < RADIX; ++d) {
+            const uint32_t c = offset[p * RADIX + d];
+            offset[p * RADIX + d] = sum;
             sum += c;
         }
     }
-    for (unsigned pass = 0; pass < 3; ++pass) {
-        const unsigned shift = 11 * pass;
-        const uint32_t mask = pass == 2 ? 1023 : 2047;
-        uint32_t* offsets = count.data() + pass * B;
-        for (float x : data)
-            temp[offsets[(float_sort_key(x) >> shift) & mask]++] = x;
-        data.swap(temp);
+
+    for (int p = 0; p < PASSES; ++p) {
+        uint32_t* pos = offset.data() + p * RADIX;
+        for (Key k : keys) tmp[pos[(k >> SHIFT[p]) & MASK[p]]++] = k;
+        keys.swap(tmp);   // 每個 pass 結束後，結果都放回 keys
     }
 }
 
-static void merge_sparse(std::vector<float>& data,
-                         const std::vector<float>& received, int k, bool lower) {
-    const int n = static_cast<int>(data.size());
-    if (lower) {
-        int i = n - k - 1, j = k - 1, out = n - 1;
-        while (i >= 0 && j >= 0) {
-#if HW1_BRANCHLESS
-            const float own = data[i], incoming = received[j];
-            const bool take_own = own > incoming;
-            data[out--] = take_own ? own : incoming;
-            i -= int(take_own);
-            j -= int(!take_own);
-#else
-            if (data[i] > received[j]) data[out--] = data[i--];
-            else data[out--] = received[j--];
-#endif
-        }
-        if (j >= 0)
-            std::memcpy(data.data(), received.data(), size_t(j + 1) * sizeof(float));
-    } else {
-        int i = k, j = 0, out = 0;
-        while (i < n && j < k) {
-#if HW1_BRANCHLESS
-            const float own = data[i], incoming = received[j];
-            const bool take_own = own < incoming;
-            data[out++] = take_own ? own : incoming;
-            i += int(take_own);
-            j += int(!take_own);
-#else
-            if (data[i] < received[j]) data[out++] = data[i++];
-            else data[out++] = received[j++];
-#endif
-        }
-        if (j < k)
-            std::memcpy(data.data() + out, received.data() + j,
-                        size_t(k - j) * sizeof(float));
-    }
-}
+// Round 1 之後：hash 輸出的 24-bit key，8 + 8 + 8 bit 三個 pass。
+// histogram 已經在 hash_and_count 裡算好：hist[p * 256 + d] = 第 p 個 pass（由低位開始）digit 為 d 的數量。
+static void radix_sort_24(Workspace& ws) {
+    if (ws.keys.size() <= 1) return;
 
-
-#ifndef HW1_MERGE_LANES
-#define HW1_MERGE_LANES 2
-#endif
-static_assert(HW1_MERGE_LANES == 2 || HW1_MERGE_LANES == 4, "Use 2 or 4 merge streams");
-#ifndef HW1_INTERLEAVED_MERGE
-#define HW1_INTERLEAVED_MERGE 1
-#endif
-
-// Find how many A values belong in the first 'diagonal' merged values.
-// Equal values from A precede equal values from B.
-static int merge_cut(const float* a, int na, const float* b, int nb, int diagonal) {
-    int lo = std::max(0, diagonal - nb), hi = std::min(diagonal, na);
-    while(lo <= hi) {
-        const int i = lo + (hi - lo) / 2, j = diagonal - i;
-        if(i > 0 && j < nb && a[i-1] > b[j]) hi = i - 1;
-        else if(j > 0 && i < na && b[j-1] >= a[i]) lo = i + 1;
-        else return i;
-    }
-    std::abort(); // Finite sorted inputs always admit a partition.
-}
-
-// Independent output partitions break the single i/j dependency chain.
-// No additional threads: one CPU interleaves independent scalar merge streams.
-static void merge_interleaved(const float* a, int na, const float* b, int nb,
-                              float* output) {
-    constexpr int L = HW1_MERGE_LANES;
-    const int n = na + nb;
-    int ia[L], ib[L], ea[L], eb[L], pos[L];
-    int previous_a = 0, previous_b = 0;
-    for(int lane = 0; lane < L; ++lane) {
-        const int end = int(int64_t(n) * (lane + 1) / L);
-        const int cut_a = lane + 1 == L ? na : merge_cut(a, na, b, nb, end);
-        const int cut_b = end - cut_a;
-        ia[lane] = previous_a; ib[lane] = previous_b;
-        ea[lane] = cut_a; eb[lane] = cut_b;
-        pos[lane] = previous_a + previous_b;
-        previous_a = cut_a; previous_b = cut_b;
-    }
-    for(;;) {
-        int batch = n;
-        for(int lane = 0; lane < L; ++lane)
-            batch = std::min(batch, std::min(ea[lane]-ia[lane], eb[lane]-ib[lane]));
-        if(batch == 0) break;
-        // Neither input can be exhausted within these 'batch' steps.
-        for(int step = 0; step < batch; ++step) {
-#pragma GCC unroll 4
-            for(int lane = 0; lane < L; ++lane) {
-                const float x = a[ia[lane]], y = b[ib[lane]];
-                const bool take_a = x <= y;
-                output[pos[lane]++] = take_a ? x : y;
-                ia[lane] += int(take_a);
-                ib[lane] += int(!take_a);
-            }
-        }
-    }
-    for(int lane = 0; lane < L; ++lane) {
-        int i = ia[lane], j = ib[lane], out = pos[lane];
-        while(i < ea[lane] && j < eb[lane]) {
-            const float x = a[i], y = b[j];
-            const bool take_a = x <= y;
-            output[out++] = take_a ? x : y;
-            i += int(take_a); j += int(!take_a);
-        }
-        if(i < ea[lane]) std::memcpy(output + out, a + i, size_t(ea[lane]-i)*sizeof(float));
-        else if(j < eb[lane]) std::memcpy(output + out, b + j, size_t(eb[lane]-j)*sizeof(float));
-    }
-}
-
-// Valid ONLY after hw1_hash: every value is an exact integer in [-2^23,2^23).
-// Map that known domain to a 24-bit unsigned key, keeping original float values.
-static inline uint32_t hash_sort_key(float x) {
-    return static_cast<uint32_t>(static_cast<int32_t>(x) + 8388608);
-}
-// Software write combining: amortize random scatter writes over 16 floats.
-static void buffered_scatter(const std::vector<float>& src, std::vector<float>& dst,
-                             uint32_t* offsets, unsigned shift,
-                             std::vector<float>& staging) {
-    constexpr unsigned B = 4096, LANES = 16;
-    uint8_t used[B] = {};
-    for(float x : src) {
-        const unsigned bucket = (hash_sort_key(x) >> shift) & (B - 1);
-        unsigned count = used[bucket];
-        staging[bucket * LANES + count] = x;
-        if (++count == LANES) {
-            std::memcpy(dst.data() + offsets[bucket], staging.data() + bucket * LANES,
-                        LANES * sizeof(float));
-            offsets[bucket] += LANES;
-            count = 0;
-        }
-        used[bucket] = static_cast<uint8_t>(count);
-    }
-    for(unsigned bucket = 0; bucket < B; ++bucket) {
-        std::memcpy(dst.data() + offsets[bucket], staging.data() + bucket * LANES,
-                    unsigned(used[bucket]) * sizeof(float));
-    }
-}
-
-static void radix_sort_hash24(std::vector<float>& data,
-                              std::vector<float>& temp,
-                              std::vector<uint32_t>& counts) {
-    if (data.size() <= 1) return;
-    constexpr unsigned B = 4096;
-    std::fill(counts.begin(), counts.end(), 0u);
-    for(float x : data) {
-        uint32_t key = hash_sort_key(x);
-        ++counts[key & (B - 1)];
-        ++counts[B + (key >> 12)];
-    }
-    for(unsigned pass = 0; pass < 2; ++pass) {
+    // histogram → 每個 digit 的起始位置（exclusive prefix sum）
+    for (int p = 0; p < PASSES_24; ++p) {
         uint32_t sum = 0;
-        for(unsigned b = 0; b < B; ++b) {
-            uint32_t c = counts[pass * B + b];
-            counts[pass * B + b] = sum;
+        for (int d = 0; d < RADIX_24; ++d) {
+            const uint32_t c = ws.hist[p * RADIX_24 + d];
+            ws.hist[p * RADIX_24 + d] = sum;
             sum += c;
         }
     }
-    if (HW1_BUFFERED && data.size() >= HW1_BUFFERED_MIN) {
-        // Each MPI process has its own scratch. thread_local also supports the test shim.
-        static thread_local std::vector<float> staging(B * 16);
-        buffered_scatter(data, temp, counts.data(), 0, staging);
-        buffered_scatter(temp, data, counts.data() + B, 12, staging);
-    } else {
-        for(float x : data)
-            temp[counts[hash_sort_key(x) & (B - 1)]++] = x;
-        for(float x : temp)
-            data[counts[B + (hash_sort_key(x) >> 12)]++] = x;
+    for (int p = 0; p < PASSES_24; ++p) {
+        uint32_t* pos = ws.hist.data() + p * RADIX_24;
+        const int shift = p * DIGIT_BITS_24;
+        for (Key k : ws.keys) ws.tmp[pos[(k >> shift) & DIGIT_MASK_24]++] = k;
+        ws.keys.swap(ws.tmp);   // 每個 pass 結束後，結果都放回 keys
     }
 }
 
-static void sort_local(std::vector<float>& data, std::vector<float>& temp,
-                       std::vector<size_t>& original_counts,
-                       std::vector<uint32_t>& small_counts, int round) {
-#if HW1_SORT == 1
-    (void) original_counts; (void) round;
-    radix_sort_float_11(data, temp, small_counts);
-#elif HW1_SORT == 2
-    if(round == 0) radix_sort_float(data, temp, original_counts);
-    else radix_sort_hash24(data, temp, small_counts);
-#else
-    (void) small_counts; (void) round;
-    radix_sort_float(data, temp, original_counts);
-#endif
+// 合併兩個已排序陣列 a、b，輸出最小的 count 個到 out。
+// 迴圈內用條件選擇取代 if/else，避免資料隨機時 branch misprediction。
+static void merge_smallest(const Key* a, int na, const Key* b, int nb, Key* out, int count) {
+    int i = 0, j = 0, k = 0;
+    while (k < count && i < na && j < nb) {
+        const Key x = a[i], y = b[j];
+        const bool take_a = (x <= y);
+        out[k++] = take_a ? x : y;
+        i += take_a;
+        j += !take_a;
+    }
+    // 其中一邊用完了，剩下的直接從另一邊複製
+    if (k < count && i < na) { const int c = std::min(count - k, na - i); std::memcpy(out + k, a + i, c * sizeof(Key)); k += c; }
+    if (k < count && j < nb) { const int c = std::min(count - k, nb - j); std::memcpy(out + k, b + j, c * sizeof(Key)); k += c; }
 }
 
-// Usage:
-//   ./hw1 N input output [rounds=25]
-
-// -----------------------------------------------------------------------------
-// Sparse compare-split for one adjacent rank pair.
-//
-// The lower rank owns sorted block A of size m.
-// The higher rank owns sorted block B of size n.
-//
-// If A.back() <= B.front(), the pair is already ordered and no data exchange is
-// necessary.
-//
-// Otherwise, find an exchange count k such that:
-//   lower rank sends A[m-k .. m-1]
-//   higher rank sends B[0 .. k-1]
-//
-// Both ranks find the same k with a distributed multi-probe search. Each
-// iteration exchanges two values at each of up to HW1_PROBES partitions.  Once k is known, only k floats
-// are exchanged in each direction.
-//
-// Returns true iff this pair performed a real compare-split.
-// -----------------------------------------------------------------------------
-static bool sparse_compare_split(
-    int rank,
-    int partner,
-    const std::vector<int>& rank_sizes,
-    std::vector<float>& data,
-    std::vector<float>& partner_buffer,
-    std::vector<float>& output_buffer,
-    int boundary_tag,
-    int search_tag,
-    int data_tag,
-    MPI_Comm comm
-) {
-    HW1_TIMER(1);
-    (void) output_buffer;
-    const int local_n = static_cast<int>(data.size());
-    const int partner_n = rank_sizes[partner];
-
-    // With the initial contiguous block distribution, zero-sized ranks can
-    // only appear at the end.  Both sides know all rank sizes, so both sides
-    // take this branch consistently and no communication is attempted.
-    if (local_n == 0 || partner_n == 0)
-        return false;
-
-    const bool am_lower = (rank < partner);
-
-    // -------------------------------------------------------------------------
-    // 1. Boundary check
-    // -------------------------------------------------------------------------
-    float my_boundary = am_lower ? data[local_n - 1] : data[0];
-    float partner_boundary = 0.0f;
-
-    MPI_Sendrecv(
-        &my_boundary,
-        1,
-        MPI_FLOAT,
-        partner,
-        boundary_tag,
-        &partner_boundary,
-        1,
-        MPI_FLOAT,
-        partner,
-        boundary_tag,
-        comm,
-        MPI_STATUS_IGNORE
-    );
-
-    float lower_max;
-    float higher_min;
-
-    if (am_lower) {
-        lower_max = my_boundary;
-        higher_min = partner_boundary;
-    } else {
-        lower_max = partner_boundary;
-        higher_min = my_boundary;
+// 合併兩個已排序陣列 a、b，輸出最大的 count 個到 out（由後往前填）。
+static void merge_largest(const Key* a, int na, const Key* b, int nb, Key* out, int count) {
+    int i = na - 1, j = nb - 1, k = count - 1;
+    while (k >= 0 && i >= 0 && j >= 0) {
+        const Key x = a[i], y = b[j];
+        const bool take_a = (x >= y);
+        out[k--] = take_a ? x : y;
+        i -= take_a;
+        j -= !take_a;
     }
+    if (k >= 0 && i >= 0) { const int c = std::min(k + 1, i + 1); std::memcpy(out + k + 1 - c, a + i + 1 - c, c * sizeof(Key)); k -= c; }
+    if (k >= 0 && j >= 0) { const int c = std::min(k + 1, j + 1); std::memcpy(out + k + 1 - c, b + j + 1 - c, c * sizeof(Key)); k -= c; }
+}
 
-    const bool need_exchange = (lower_max > higher_min);
+// =============================================================================
+// 跨節點壓縮：已排序的 key 改送「差值」，並用 varint 編碼
+//
+// 例：8000000, 8000007, 8000019 → 8000000, 7, 12
+// varint：每個 byte 放 7 bit，最高位元 = 1 表示後面還有 byte。
+//   差值 < 128 → 1 byte，< 16384 → 2 byte，最多 5 byte（32-bit）。
+// hash 之後的 key 只有 24 bit，相鄰差值通常不到 128，所以大多只要 1 byte。
+// 解碼時把差值一個一個加回去，得到的資料和原本完全相同。
+// =============================================================================
+constexpr int MAX_VARINT_BYTES = 5;
 
-    if (!need_exchange)
-        return false;
-
-    // -------------------------------------------------------------------------
-    // 2. Find the exact number k of elements that must cross the rank boundary.
-    //
-    // Let A be the lower-rank block with size m and B be the higher-rank block
-    // with size n.  After compare-split, lower rank must still own m elements.
-    // If k values are taken from B, exactly k values must leave A.
-    //
-    // The valid partition satisfies:
-    //   A[m-k-1] <= B[k]     (when those indices exist)
-    //   B[k-1]   <= A[m-k]   (when those indices exist)
-    //
-    // Both ranks run the same multi-probe search state. Lower sends A probes
-    // and higher sends B probes. Thus both ranks derive
-    // the same k and will use identical MPI counts in the final Sendrecv.
-    // -------------------------------------------------------------------------
-    const int lower_rank = std::min(rank, partner);
-    const int higher_rank = std::max(rank, partner);
-
-    const int m = rank_sizes[lower_rank];
-    const int n = rank_sizes[higher_rank];
-
-    int lo = 1;  // need_exchange == true guarantees k > 0
-    int hi = std::min(m, n);
-    int exchange_count = -1;
-
-    const float neg_inf = -std::numeric_limits<float>::infinity();
-    const float pos_inf = std::numeric_limits<float>::infinity();
-
-    while (lo <= hi && exchange_count < 0) {
-        const int span = hi - lo + 1;
-        const int q = std::min(HW1_PROBES, span);
-        int pivots[HW1_PROBES];
-        float probes[2 * HW1_PROBES], peer[2 * HW1_PROBES];
-        for(int j = 0; j < q; ++j) {
-            const int k = lo + int(int64_t(j + 1) * span / (q + 1));
-            pivots[j] = k;
-            if(am_lower) {
-                probes[2*j] = m-k-1 >= 0 ? data[m-k-1] : neg_inf;
-                probes[2*j+1] = data[m-k];
-            } else {
-                probes[2*j] = data[k-1];
-                probes[2*j+1] = k < n ? data[k] : pos_inf;
-            }
+static int encode_sorted(const Key* in, int n, uint8_t* out) {
+    uint8_t* p = out;
+    Key prev = 0;
+    for (int i = 0; i < n; ++i) {
+        uint32_t d = in[i] - prev;   // 已排序，所以差值一定 >= 0
+        prev = in[i];
+        while (d >= 0x80) {
+            *p++ = static_cast<uint8_t>(d | 0x80);
+            d >>= 7;
         }
-        MPI_Sendrecv(probes, 2*q, MPI_FLOAT, partner, search_tag,
-                     peer, 2*q, MPI_FLOAT, partner, search_tag, comm, MPI_STATUS_IGNORE);
-        for(int j = 0; j < q; ++j) {
-            const float a_left = am_lower ? probes[2*j] : peer[2*j];
-            const float a_right = am_lower ? probes[2*j+1] : peer[2*j+1];
-            const float b_left = am_lower ? peer[2*j] : probes[2*j];
-            const float b_right = am_lower ? peer[2*j+1] : probes[2*j+1];
-            const int k = pivots[j];
-            if(a_left > b_right) lo = k + 1;
-            else if(b_left > a_right) { hi = k - 1; break; }
-            else { exchange_count = k; break; }
-        }
+        *p++ = static_cast<uint8_t>(d);
     }
+    return static_cast<int>(p - out);
+}
 
-    // For two finite sorted blocks with an inverted boundary, a valid
-    // partition must exist.  Abort rather than silently risk mismatched MPI
-    // counts if something unexpected happens.
-    if (exchange_count <= 0) {
-        std::fprintf(
-            stderr,
-            "Rank %d: failed to find compare-split partition with rank %d\n",
-            rank,
-            partner
-        );
-        MPI_Abort(comm, 2);
+// 回傳解出的 key 數量
+static int decode_sorted(const uint8_t* in, int num_bytes, Key* out) {
+    const uint8_t* p = in;
+    const uint8_t* end = in + num_bytes;
+    Key prev = 0;
+    int n = 0;
+    while (p < end) {
+        uint32_t d = 0;
+        int shift = 0;
+        uint8_t b;
+        do {
+            b = *p++;
+            d |= static_cast<uint32_t>(b & 0x7f) << shift;
+            shift += 7;
+        } while (b & 0x80);
+        prev += d;
+        out[n++] = prev;
     }
+    return n;
+}
 
-    const int k = exchange_count;
+// 和 partner 交換一段已排序的 key，回傳收到的數量。
+// 跨節點（compress = true）時壓縮後再送；同一台節點走共享記憶體，直接送比較快。
+static int exchange_sorted(Workspace& ws, const Key* send_ptr, int send_n, int partner, bool compress) {
+    MPI_Status status;
+    int recv_n = 0;
+    if (!compress) {
+        // 對方送多少，事先不知道：用最大可能的長度接收，再用 MPI_Get_count 讀出實際數量
+        MPI_Sendrecv(send_ptr, send_n, MPI_UINT32_T, partner, TAG_DATA,
+                     ws.recv.data(), static_cast<int>(ws.recv.size()), MPI_UINT32_T, partner, TAG_DATA,
+                     MPI_COMM_WORLD, &status);
+        MPI_Get_count(&status, MPI_UINT32_T, &recv_n);
+        return recv_n;
+    }
+    const int send_bytes = encode_sorted(send_ptr, send_n, ws.send_bytes.data());
+    MPI_Sendrecv(ws.send_bytes.data(), send_bytes, MPI_BYTE, partner, TAG_DATA,
+                 ws.recv_bytes.data(), static_cast<int>(ws.recv_bytes.size()), MPI_BYTE, partner, TAG_DATA,
+                 MPI_COMM_WORLD, &status);
+    int recv_bytes = 0;
+    MPI_Get_count(&status, MPI_BYTE, &recv_bytes);
+    return decode_sorted(ws.recv_bytes.data(), recv_bytes, ws.recv.data());
+}
 
-    // k <= min(local_n, partner_n), so partner_buffer(local_n) is always large
-    // enough on the receiving rank.
-    const float* send_ptr = nullptr;
+// 兩個「已排序」block 之間的 compare-split。
+//   lower rank（編號較小）留下聯集中最小的 local_n 個；
+//   upper rank 留下最大的 local_n 個。
+static bool compare_split_sorted(Workspace& ws, int rank, int partner, bool compress) {
+    std::vector<Key>& mine = ws.keys;
+    const int n = static_cast<int>(mine.size());
+    const bool is_lower = rank < partner;
 
-    if (am_lower) {
-        // Lower rank sends only its largest k values.
-        send_ptr = data.data() + (local_n - k);
+    // Step 1：交換邊界值。lower 的最大值 <= upper 的最小值 → 已有序，不用交換。
+    const Key my_edge = is_lower ? mine.back() : mine.front();
+    const Key partner_edge = exchange_one(my_edge, partner);
+    const Key lower_max = is_lower ? my_edge : partner_edge;
+    const Key upper_min = is_lower ? partner_edge : my_edge;
+    if (lower_max <= upper_min) return false;
+
+    // Step 2：只送出「可能需要移動」的元素。
+    //   lower：<= upper_min 的元素一定會留下，只送出 > upper_min 的尾端
+    //   upper：>= lower_max 的元素一定會留下，只送出 < lower_max 的前端
+    const Key* send_ptr;
+    int send_n;
+    if (is_lower) {
+        const Key* first = std::upper_bound(mine.data(), mine.data() + n, upper_min);
+        send_ptr = first;
+        send_n = static_cast<int>(mine.data() + n - first);
     } else {
-        // Higher rank sends only its smallest k values.
-        send_ptr = data.data();
+        const Key* last = std::lower_bound(mine.data(), mine.data() + n, lower_max);
+        send_ptr = mine.data();
+        send_n = static_cast<int>(last - mine.data());
     }
 
-    MPI_Sendrecv(
-        send_ptr,
-        k,
-        MPI_FLOAT,
-        partner,
-        data_tag,
-        partner_buffer.data(),
-        k,
-        MPI_FLOAT,
-        partner,
-        data_tag,
-        comm,
-        MPI_STATUS_IGNORE
-    );
+    const int recv_n = exchange_sorted(ws, send_ptr, send_n, partner, compress);
 
-#if HW1_MERGE
-    if(HW1_INTERLEAVED_MERGE && local_n >= 65536 && std::min(k, local_n-k) >= local_n/16) {
-        const float* retained = data.data() + (am_lower ? 0 : k);
-        merge_interleaved(retained, local_n-k, partner_buffer.data(), k, output_buffer.data());
-        data.swap(output_buffer);
-    } else {
-        merge_sparse(data, partner_buffer, k, am_lower);
-    }
-#else
-    // -------------------------------------------------------------------------
-    // 3. Partial merge using reusable output_buffer.
-    //
-    // Lower rank:
-    //   merge A[0 .. m-k-1] with received B[0 .. k-1]
-    //   and produce exactly m values.
-    //
-    // Higher rank:
-    //   merge received A[m-k .. m-1] with B[k .. n-1] from the back
-    //   and produce exactly n values.
-    // -------------------------------------------------------------------------
-    if (am_lower) {
-        int i = 0;
-        int j = 0;
-        int out = 0;
-
-        const int own_end = local_n - k;
-
-        while (out < local_n) {
-            if (i < own_end &&
-                (j >= k || data[i] <= partner_buffer[j])) {
-                output_buffer[out++] = data[i++];
-            } else {
-                output_buffer[out++] = partner_buffer[j++];
-            }
-        }
-    } else {
-        int i = local_n - 1;
-        int j = k - 1;
-        int out = local_n - 1;
-
-        const int own_begin = k;
-
-        while (out >= 0) {
-            if (i >= own_begin &&
-                (j < 0 || data[i] >= partner_buffer[j])) {
-                output_buffer[out--] = data[i--];
-            } else {
-                output_buffer[out--] = partner_buffer[j--];
-            }
-        }
-    }
-
-    data.swap(output_buffer);
-#endif
+    // Step 3：只合併需要的那一半，結果寫到 tmp 再交換指標（不 copy 回來）
+    if (is_lower) merge_smallest(mine.data(), n, ws.recv.data(), recv_n, ws.tmp.data(), n);
+    else          merge_largest (mine.data(), n, ws.recv.data(), recv_n, ws.tmp.data(), n);
+    mine.swap(ws.tmp);
     return true;
 }
 
-// Runtime dispatch keeps the default executable usable on other x86 CPUs.
-// The hash.h implementation itself is unchanged.
-#ifndef HW1_AVX2_HASH
-#define HW1_AVX2_HASH 1
+// =============================================================================
+// Hash（同時統計下一輪 radix sort 需要的 histogram）
+// =============================================================================
+//
+// 分成小段處理：每段先做 hash（這個迴圈沒有相依性，編譯器可以向量化），
+// 再對同一段統計 histogram（這段資料還在 cache 裡，幾乎不用再讀記憶體）。
+// 如果把 ++hist[...] 寫在 hash 的同一個迴圈裡，整個迴圈就無法向量化。
+//
+// target_clones：編譯器同時產生 AVX2 版和一般版，執行時依 CPU 自動挑選。
+// hw1_hash 裡有 32-bit 整數乘法，沒有 AVX2 時很難向量化。
+#if defined(__GNUC__) && !defined(__clang__) && defined(__x86_64__)
+#define VECTORIZE_CLONES __attribute__((target_clones("avx2", "default")))
+#else
+#define VECTORIZE_CLONES
 #endif
-#if HW1_AVX2_HASH && defined(__GNUC__) && !defined(__clang__) && defined(__x86_64__)
-__attribute__((target_clones("avx2", "default")))
-#endif
-static void hash_block(float* values, int count, uint32_t start, uint32_t round) {
-    for(int i = 0; i < count; ++i)
-        values[i] = hw1_hash(values[i], start + uint32_t(i), round);
+template <bool KEYS_ARE_FLOAT>
+VECTORIZE_CLONES static void hash_and_count(Workspace& ws, uint32_t global_start, uint32_t hash_round) {
+    constexpr size_t CHUNK = 2048;
+    std::fill(ws.hist.begin(), ws.hist.end(), 0u);
+    Key* keys = ws.keys.data();
+    const size_t n = ws.keys.size();
+
+    for (size_t begin = 0; begin < n; begin += CHUNK) {
+        const size_t end = std::min(n, begin + CHUNK);
+
+        for (size_t i = begin; i < end; ++i) {
+            // 先把 key 還原成原本的 float 值，再交給 hash.h 的 hw1_hash
+            const float value = KEYS_ARE_FLOAT ? bits_to_float(key_to_float_bits(keys[i]))
+                                               : hash_key_to_float(keys[i]);
+            const float hashed = hw1_hash(value, global_start + static_cast<uint32_t>(i), hash_round);
+            keys[i] = hash_output_to_key(hashed);
+        }
+        for (size_t i = begin; i < end; ++i) {
+            ++ws.hist[keys[i] & DIGIT_MASK_24];
+            ++ws.hist[RADIX_24 + ((keys[i] >> DIGIT_BITS_24) & DIGIT_MASK_24)];
+            ++ws.hist[2 * RADIX_24 + ((keys[i] >> (2 * DIGIT_BITS_24)) & DIGIT_MASK_24)];
+        }
+    }
 }
 
+// =============================================================================
+// main
+// =============================================================================
 int main(int argc, char** argv) {
     MPI_Init(&argc, &argv);
-#ifdef HW1_PROFILE
-    const double hw1_total_start = MPI_Wtime();
-#endif
 
-    int rank = 0;
-    int size = 1;
-
+    int rank = 0, size = 1;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
 
     if (argc < 4) {
-        if (rank == 0) {
-            std::fprintf(
-                stderr,
-                "Usage: %s N input output [rounds=25]\n",
-                argv[0]
-            );
-        }
-
+        if (rank == 0) std::fprintf(stderr, "Usage: %s N input output [hash_rounds=25]\n", argv[0]);
         MPI_Finalize();
         return 1;
     }
-
-    const long long n_ll = std::atoll(argv[1]);
-
-    if (n_ll < 1 || n_ll > 536870911LL) {
-        if (rank == 0)
-            std::fprintf(stderr, "Invalid N\n");
-
-        MPI_Finalize();
-        return 1;
-    }
-
-    const int n = static_cast<int>(n_ll);
-
+    const int n = std::atoi(argv[1]);
     const char* input_file = argv[2];
     const char* output_file = argv[3];
+    const int rounds = (argc >= 5) ? std::atoi(argv[4]) : 25;
 
-    int rounds = 25;
+    const Layout L = make_layout(rank, size, n);
 
-    if (argc >= 5)
-        rounds = std::atoi(argv[4]);
+    Workspace ws;
+    ws.keys.resize(L.local_n);
+    ws.tmp.resize(L.local_n);
+    ws.recv.resize(std::max(L.max_count, 1));
+    ws.hist.resize(PASSES_24 * RADIX_24);
 
-    if (rounds < 1) {
-        if (rank == 0)
-            std::fprintf(stderr, "Invalid rounds\n");
-
-        MPI_Finalize();
-        return 1;
+    // 左右鄰居是否在別台節點：是的話，和它交換資料時要壓縮
+    const bool remote_left = rank > 0 && L.node[rank - 1] != L.node[rank];
+    const bool remote_right = rank + 1 < size && L.node[rank + 1] != L.node[rank];
+    if (remote_left || remote_right) {
+        const size_t bytes = static_cast<size_t>(std::max(L.max_count, 1)) * MAX_VARINT_BYTES;
+        ws.send_bytes.resize(bytes);
+        ws.recv_bytes.resize(bytes);
     }
 
-    // =========================================================================
-    // Initial block distribution
-    // =========================================================================
-    int active_size = size;
-    if(HW1_FIRST_NODE) {
-        char hostname[MPI_MAX_PROCESSOR_NAME] = {};
-        int hostname_length = 0;
-        MPI_Get_processor_name(hostname, &hostname_length);
-        std::vector<char> hosts(size_t(size) * MPI_MAX_PROCESSOR_NAME);
-        MPI_Allgather(hostname, MPI_MAX_PROCESSOR_NAME, MPI_CHAR,
-                      hosts.data(), MPI_MAX_PROCESSOR_NAME, MPI_CHAR, MPI_COMM_WORLD);
-        active_size = 1;
-        while(active_size < size &&
-              std::strcmp(hosts.data(), hosts.data() + size_t(active_size) * MPI_MAX_PROCESSOR_NAME) == 0)
-            ++active_size;
-    }
-    if(HW1_MAX_ACTIVE > 0) active_size = std::min(active_size, HW1_MAX_ACTIVE);
-    const int base = n / active_size;
-    const int rem = n % active_size;
-
-    const int local_n = rank < active_size ? base + (rank < rem ? 1 : 0) : 0;
-
-    // local_n never changes, so global_start is constant across all rounds.
-    const int global_start = rank < active_size
-        ? rank * base + std::min(rank, rem) : n;
-
-    std::vector<int> rank_sizes(size);
-
-    for (int r = 0; r < size; ++r) {
-        rank_sizes[r] =
-            r < active_size ? base + (r < rem ? 1 : 0) : 0;
-    }
-
-    std::vector<float> data(local_n);
-
-    // Reusable buffers.  A rank never receives more than local_n values in the
-    // sparse exchange because k <= min(local_n, partner_n).
-    std::vector<float> partner_buffer(local_n);
-    std::vector<float> output_buffer(local_n);
-
-    // Reused by every local radix sort; no per-round allocation.
-    std::vector<size_t> radix_count(1u << 16);
-    std::vector<uint32_t> small_counts(HW1_SORT == 1 ? 6144 : HW1_SORT == 2 ? 8192 : 0);
-
-    // =========================================================================
-    // MPI-IO input
-    // =========================================================================
+    // ---- 讀檔：直接以 32-bit 整數讀入 float 的 bit pattern ----------------------
     {
-    HW1_TIMER(4);
-    MPI_File input_fh;
-
-    MPI_File_open(
-        MPI_COMM_WORLD,
-        input_file,
-        MPI_MODE_RDONLY,
-        MPI_INFO_NULL,
-        &input_fh
-    );
-
-    const MPI_Offset input_offset =
-        static_cast<MPI_Offset>(global_start) * sizeof(float);
-
-    MPI_File_read_at_all(
-        input_fh,
-        input_offset,
-        data.data(),
-        local_n,
-        MPI_FLOAT,
-        MPI_STATUS_IGNORE
-    );
-
-    MPI_File_close(&input_fh);
+        MPI_File fh;
+        check_io(MPI_File_open(MPI_COMM_WORLD, input_file, MPI_MODE_RDONLY, MPI_INFO_NULL, &fh),
+                 "open input", input_file);
+        check_io(MPI_File_read_at_all(fh, static_cast<MPI_Offset>(L.global_start) * sizeof(float),
+                                      ws.keys.data(), L.local_n, MPI_UINT32_T, MPI_STATUS_IGNORE),
+                 "read input", input_file);
+        MPI_File_close(&fh);
     }
+    for (Key& k : ws.keys) k = float_bits_to_key(k);
 
-    // Keep the same finite-input safety check.
-    for (float x : data) {
-        if (!std::isfinite(x)) {
-            std::fprintf(
-                stderr,
-                "Rank %d: invalid input value\n",
-                rank
-            );
-            MPI_Abort(MPI_COMM_WORLD, 1);
-        }
-    }
+    // ---- 多輪排序 ---------------------------------------------------------------
+    bool keys_are_float = true;   // round 0 是 32-bit float key，之後都是 24-bit hash key
 
-    // =========================================================================
-    // Multi-round sort + hash
-    // =========================================================================
     for (int round = 0; round < rounds; ++round) {
+        if (keys_are_float) radix_sort_32(ws.keys, ws.tmp);
+        else                radix_sort_24(ws);   // histogram 已在上一輪結尾的 hash 中算好
+        run_odd_even_phases(L, [&](int partner) {
+            const bool compress = L.node[partner] != L.node[rank];
+            return compare_split_sorted(ws, rank, partner, compress);
+        });
 
-        // Each round starts by sorting the rank's current local block.
-        {
-            HW1_TIMER(0);
-            sort_local(data, output_buffer, radix_count, small_counts, round);
-        }
-
-        bool globally_sorted = HW1_STOP && (std::min(n, active_size) <= 1);
-
-        // Check every two cycles. HW1_STOP uses the latest cycle only;
-        // its zero-change result already proves all adjacent boundaries are ordered.
-        int pending_changed = 0;
-        int cycles_since_allreduce = 0;
-
-        while (!globally_sorted) {
-            int cycle_changed = 0;
-
-            // =================================================================
-            // EVEN phase: (0,1), (2,3), ...
-            // =================================================================
-            int partner;
-
-            if ((rank & 1) == 0)
-                partner = rank + 1;
-            else
-                partner = rank - 1;
-
-            if (partner >= 0 && partner < size) {
-                const bool changed = sparse_compare_split(
-                    rank,
-                    partner,
-                    rank_sizes,
-                    data,
-                    partner_buffer,
-                    output_buffer,
-                    10,  // boundary tag
-                    11,  // partition-search tag
-                    12,  // sparse-data tag
-                    MPI_COMM_WORLD
-                );
-
-                if (changed)
-                    cycle_changed = 1;
-            }
-
-            // =================================================================
-            // ODD phase: (1,2), (3,4), ...
-            // =================================================================
-            if ((rank & 1) == 0)
-                partner = rank - 1;
-            else
-                partner = rank + 1;
-
-            if (partner >= 0 && partner < size) {
-                const bool changed = sparse_compare_split(
-                    rank,
-                    partner,
-                    rank_sizes,
-                    data,
-                    partner_buffer,
-                    output_buffer,
-                    20,  // boundary tag
-                    21,  // partition-search tag
-                    22,  // sparse-data tag
-                    MPI_COMM_WORLD
-                );
-
-                if (changed)
-                    cycle_changed = 1;
-            }
-
-            // Preserve any change observed during the two-cycle window.
-            if (cycle_changed)
-                pending_changed = 1;
-
-            ++cycles_since_allreduce;
-
-            // =================================================================
-            // Global termination detection every 2 complete cycles.
-            //
-            // This cannot terminate early: global_changed is zero only when no
-            // rank changed in either of the two cycles in the current window.
-            // It can only do some extra work compared with checking every cycle.
-            // =================================================================
-            if (cycles_since_allreduce == 2) {
-                int global_changed = 0;
-
-                {
-                    HW1_TIMER(2);
-                MPI_Allreduce(
-                    HW1_STOP ? &cycle_changed : &pending_changed,
-                    &global_changed,
-                    1,
-                    MPI_INT,
-                    MPI_MAX,
-                    MPI_COMM_WORLD
-                );
-
-                }
-                globally_sorted = (global_changed == 0);
-
-                pending_changed = 0;
-                cycles_since_allreduce = 0;
-            }
-        }
-
-        // global_start is unchanged because every rank always retains exactly
-        // local_n elements.  No per-round MPI_Exscan is necessary.
-
+        // 這一輪全域已排好；除了最後一輪，都要 hash（hash round 從 1 開始）
         if (round + 1 < rounds) {
-            HW1_TIMER(3);
-            hash_block(data.data(), local_n, uint32_t(global_start), uint32_t(round + 1));
+            if (keys_are_float) hash_and_count<true>(ws, L.global_start, round + 1);
+            else                hash_and_count<false>(ws, L.global_start, round + 1);
+            keys_are_float = false;
         }
     }
 
-    // =========================================================================
-    // MPI-IO output
-    // =========================================================================
-    {
-    HW1_TIMER(5);
-    MPI_File output_fh;
-
-    MPI_File_open(
-        MPI_COMM_WORLD,
-        output_file,
-        MPI_MODE_CREATE | MPI_MODE_WRONLY,
-        MPI_INFO_NULL,
-        &output_fh
-    );
-
-    MPI_File_set_size(
-        output_fh,
-        static_cast<MPI_Offset>(n) * sizeof(float)
-    );
-
-    const MPI_Offset output_offset =
-        static_cast<MPI_Offset>(global_start) * sizeof(float);
-
-    MPI_File_write_at_all(
-        output_fh,
-        output_offset,
-        data.data(),
-        local_n,
-        MPI_FLOAT,
-        MPI_STATUS_IGNORE
-    );
-
-    MPI_File_close(&output_fh);
+    // ---- 寫檔：key 轉回 float 的 bit pattern ------------------------------------
+    for (Key& k : ws.keys) {
+        if (keys_are_float) {
+            k = key_to_float_bits(k);
+        } else {
+            const float value = hash_key_to_float(k);
+            std::memcpy(&k, &value, sizeof(k));
+        }
     }
-#ifdef HW1_PROFILE
-    double local[7], maxima[7];
-    for(int i = 0; i < 6; ++i) local[i] = hw1_times[i];
-    local[6] = MPI_Wtime() - hw1_total_start;
-    MPI_Reduce(local, maxima, 7, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
-    if(rank == 0) std::fprintf(stderr,
-        "HW1_PROFILE sort=%d merge=%d stop=%d ranks=%d active=%d N=%d rounds=%d "
-        "local_sort=%.9f compare_split=%.9f termination=%.9f hash=%.9f "
-        "input=%.9f output=%.9f total=%.9f\n",
-        HW1_SORT, HW1_MERGE, HW1_STOP, size, active_size, n, rounds,
-        maxima[0], maxima[1], maxima[2], maxima[3], maxima[4], maxima[5], maxima[6]);
-#endif
+    {
+        MPI_File fh;
+        check_io(MPI_File_open(MPI_COMM_WORLD, output_file, MPI_MODE_CREATE | MPI_MODE_WRONLY,
+                               MPI_INFO_NULL, &fh),
+                 "open output", output_file);
+        // 檔案原本若比較大，先截斷，避免殘留舊資料
+        check_io(MPI_File_set_size(fh, static_cast<MPI_Offset>(n) * sizeof(float)),
+                 "truncate output", output_file);
+        check_io(MPI_File_write_at_all(fh, static_cast<MPI_Offset>(L.global_start) * sizeof(float),
+                                       ws.keys.data(), L.local_n, MPI_UINT32_T, MPI_STATUS_IGNORE),
+                 "write output", output_file);
+        MPI_File_close(&fh);
+    }
 
     MPI_Finalize();
     return 0;
 }
-
